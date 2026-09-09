@@ -1,101 +1,243 @@
-# SerialKiller ![SerialKiller Logo](https://ikkisoft.com/img/sk.png "SerialKiller Logo")
+# SerialKiller (Go)
 
-**SerialKiller** is an easy-to-use look-ahead Java deserialization library to secure application from untrusted input.
+SerialKiller is an easy-to-use look-ahead deserialization filter for Java
+serialization streams. It decides, for every class encountered while decoding a
+Java serialized object graph, whether deserialization may proceed, based on
+configurable **blacklist** and **whitelist** regular expressions.
 
-When Java serialization is used to exchange information between a client and a server, attackers can replace the legitimate serialized stream with malicious data. Inspired by this [article](http://www.ibm.com/developerworks/library/se-lookahead/), SerialKiller inspects Java classes during naming resolution and allows a combination of blacklisting/whitelisting to secure your application.
+This is a faithful Go migration of the original Java library
+[`org.nibblesec.tools.SerialKiller`](https://github.com/ikkisoft/SerialKiller).
+It preserves the original's observable behavior: the same filtering rules and
+precedence, the same accept/reject decisions, the same error messages, and the
+same log output.
 
-![SerialKiller in action](http://i.imgur.com/wgoF62D.png "SerialKiller in action")
+## How the migration relates to the Java original
 
-> **Disclaimer:** 
-> This library may (or may not) be 100% production ready yet. Use at your own risk!
+The Java `SerialKiller` extends `java.io.ObjectInputStream` and overrides
+`resolveClass(...)` to apply the blacklist/whitelist decision for each class the
+JVM is about to resolve while deserializing.
 
-### How to protect your application with SerialKiller
-1. Download the latest version of the [SerialKiller's Jar](https://github.com/ikkisoft/SerialKiller/releases/). Alternatively, this library is also available on [Maven Central](http://search.maven.org/#search%7Cga%7C1%7Cserialkiller)
-2. Import SerialKiller's Jar in your project
-3. Replace your deserialization *ObjectInputStream* with SerialKiller
-4. Tune the configuration file, based on your application requirements
+Go has no `ObjectInputStream`. To reproduce the same behavior, this package
+includes a parser for the Java serialization stream format (see
+`serialkiller/javaserial.go`). It walks the stream, discovers every class
+descriptor in the exact order Java's `ObjectInputStream` would resolve them
+(including superclass descriptors and array element classes), and invokes the
+same blacklist/whitelist decision for each. When a class is rejected, the read
+aborts at exactly that class — mirroring the `InvalidClassException` the JVM
+would throw mid-stream.
 
-Easy, isn't it? Let's look at a few details...
+The security guarantees of the original are preserved: the filter is
+**default-deny** (a class must match the whitelist to be accepted), the
+blacklist is checked first, and rejection aborts the whole deserialization.
 
-### Changes required in your code (step 3)
-In your original code, you'll probably have something similar to:
+## Requirements
 
-```java
-ObjectInputStream ois = new ObjectInputStream(is);
-String msg = (String) ois.readObject();
+- Go 1.23 or newer.
+- No third-party dependencies. The implementation uses only the Go standard
+  library (`encoding/xml`, `regexp`, `os`, `sync`, `log`, `encoding/binary`,
+  etc.).
+
+The Java original depended on `commons-configuration` (XML config parsing +
+file-change reloading), `commons-logging` (log output), and pulled in
+`commons-collections`/`commons-lang` transitively. Their behaviorally relevant
+parts are reproduced here directly with the standard library: XML config parsing
+via `encoding/xml`, refresh-based file reloading via file mtime checks, and log
+output via the `log` package behind a small `Logger` interface.
+
+## Build and test
+
+```sh
+go build ./...
+go test ./...
 ```
 
-In order to detect malicious payloads or allow your application's classes only, we need to use SerialKiller instead of the standard *java.io.ObjectInputStream*. This can be done with a one-line change:
+To see the speed-test timing output:
 
-```java
-ObjectInputStream ois = new SerialKiller(is, "/etc/serialkiller.conf");
-String msg = (String) ois.readObject();
+```sh
+go test -v -run TestSerialKiller_Speed ./serialkiller/
 ```
 
-The second argument is the location of SerialKiller's configuration file.
+## Usage
 
-Finally, you may want to catch *InvalidClassException* exceptions to gracefully handle insecure object deserializations. 
-Please note that this library does require *Java 8*.
+`NewSerialKiller` wraps any `io.Reader` carrying a Java serialization stream and
+filters it against a configuration file. `ReadObject` decodes the next object,
+applying the filter to every class in the graph.
 
-### Tuning SerialKiller's configuration file (step 4)
-SerialKiller config supports the following settings:
+```go
+package main
 
- - **Refresh**: The refresh delay in milliseconds, used to *hot-reload* the configuration file. Good news! You don't need to restart your application if you change the config file
- - **BlackList**: A [Java regex](http://docs.oracle.com/javase/7/docs/api/java/util/regex/Pattern.html) to define malicious classes. The [default configuration file](https://github.com/ikkisoft/SerialKiller/blob/master/config/serialkiller.conf) already includes several known payloads so that your application is protected by default against known attacks
- - **WhiteList**: A [Java regex](http://docs.oracle.com/javase/7/docs/api/java/util/regex/Pattern.html) to define classes used by your application. If you can quickly identify a list of trusted classes, this is the best way to secure your application. For instance, you could allow classes in your own package only
- - **Profiling**: Starting from v0.4, SerialKiller introduces a *profiling* mode to enumerate classes deserialized by the application. In this mode, the deserialization is not blocked. To protect your application, make sure to use *'false'* for this setting in production (default value)
- - **Logging**: Logging support compatible to native LogManager using the *java.util.logging.config.file* system property or *lib/logging.properties*. See [Java8 LogManager](https://docs.oracle.com/javase/8/docs/api/java/util/logging/LogManager.html) for more details.
+import (
+	"errors"
+	"fmt"
+	"os"
 
-Example of *serialkiller.conf*
+	"github.com/ikkisoft/serialkiller/serialkiller"
+)
+
+func main() {
+	f, err := os.Open("payload.ser")
+	if err != nil {
+		panic(err)
+	}
+	defer f.Close()
+
+	sk, err := serialkiller.NewSerialKiller(f, "config/serialkiller.conf")
+	if err != nil {
+		// Configuration could not be loaded/parsed.
+		panic(err)
+	}
+
+	obj, err := sk.ReadObject()
+	if err != nil {
+		var ice *serialkiller.InvalidClassError
+		if errors.As(err, &ice) {
+			// A class was blocked by the blacklist/whitelist filter.
+			fmt.Printf("blocked class %q: %s\n", ice.ClassName, ice.Error())
+			return
+		}
+		panic(err)
+	}
+
+	fmt.Printf("deserialized: %v\n", obj)
+}
+```
+
+## Configuration
+
+The configuration file is XML, identical in shape to the Java original. Example:
 
 ```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!-- serialkiller.conf -->
 <config>
   <refresh>6000</refresh>
   <mode>
-    <!-- set to 'false' for blocking mode -->
     <profiling>false</profiling>
   </mode>
   <blacklist>
-  <!--Section for Regular Expressions-->
     <regexps>
-        <!-- ysoserial's BeanShell1 payload  -->
-        <regexp>bsh\.XThis$</regexp>
-        <regexp>bsh\.Interpreter$</regexp>
-        <!-- ysoserial's C3P0 payload  -->
-        <regexp>com\.mchange\.v2\.c3p0\.impl\.PoolBackedDataSourceBase$</regexp>
-	    <!-- ysoserial's MozillaRhino1 payload -->
-	    <regexp>org\.mozilla\.javascript\..*$</regexp>
-        [...]
+      <regexp>bsh\.XThis$</regexp>
+      <regexp>org\.hibernate\.engine\.spi\.TypedValue$</regexp>
+      <!-- ... -->
     </regexps>
-    <!--Section for full-package name-->
-    <list>
-        <!-- ysoserial's CommonsCollections1,3,5,6 payload  -->
-        <name>org.apache.commons.collections.functors.InstantiateTransformer</name>
-        <name>org.apache.commons.collections.functors.ConstantTransformer</name>
-        <name>org.apache.commons.collections.functors.ChainedTransformer</name>
-        <name>org.apache.commons.collections.functors.InvokerTransformer</name>
-        [...]
-    </list>
   </blacklist>
   <whitelist>
     <regexps>
-        <regexp>.*</regexp>
+      <regexp>java\.lang\..*</regexp>
+      <regexp>java\.util\..*</regexp>
     </regexps>
   </whitelist>
 </config>
-
 ```
 
-### Credits
- - Ironically, SerialKiller uses some [Apache Commons](https://commons.apache.org/) libraries (configuration, logging, lang, collections)
- - Thanks to [@frohoff](https://twitter.com/frohoff) and [@gebl](https://twitter.com/gebl) for their work on unsafe Java object deserialization payloads. [Ysoserial](https://github.com/frohoff/ysoserial) is awesome!
- - [Pierre Ernst](http://www.ibm.com/developerworks/library/se-lookahead/#authorN10032) for the original idea around look-ahead java deserialization filters
+Elements read by the implementation:
 
-### License
-This library has been dual-licensed to Apache License, Version 2.0 and GNU General Public License.
+| Element                      | Meaning                                   | Default |
+|------------------------------|-------------------------------------------|---------|
+| `refresh`                    | Reload check interval, in milliseconds    | `6000`  |
+| `mode/profiling`             | Profiling (non-blocking) mode when `true` | `false` |
+| `blacklist/regexps/regexp`   | Ordered list of blacklist patterns        | (empty) |
+| `whitelist/regexps/regexp`   | Ordered list of whitelist patterns        | (empty) |
 
-### Contributing
- - If you've discovered a bug, please open an [issue in Github](https://github.com/ikkisoft/SerialKiller/issues).
- - Submit a new RB, especially if you're aware of Java gadgets that can be abused by vulnerable applications. Providing a safe default configuration is extremely useful for less security-oriented users. 
+Notes:
+
+- A `<list><name>...</name></list>` block appears in some historical configs.
+  It is **ignored** — the original implementation never read it, and neither
+  does this migration.
+- An empty `<blacklist></blacklist>` (or `<whitelist></whitelist>`) yields an
+  empty pattern list.
+- A missing/empty/non-XML file, or a regex pattern that fails to compile,
+  causes configuration loading to fail with an `*IllegalStateError` (mirroring
+  the Java `IllegalStateException`).
+
+Configuration instances are cached and shared by file path (mirroring the
+static cache in the Java original), so multiple `SerialKiller` instances built
+from the same config file share one `Configuration`.
+
+### Hot reload
+
+When the config file changes on disk, it is reloaded on the next filtering
+decision, provided the `refresh` interval has elapsed since the last check —
+reproducing the Java `FileChangedReloadingStrategy` with `setRefreshDelay`.
+Reload failures are swallowed and the previous configuration remains in effect.
+
+## Filtering and security semantics
+
+For each class name encountered in the stream, `resolveClass` applies exactly
+this logic (identical to the Java original):
+
+1. **Blacklist** (checked first). Each blacklist pattern is tested against the
+   class name using **unanchored substring matching** (Java `Matcher.find()`;
+   Go `regexp.MatchString` has the same semantics).
+   - In blocking mode: on the first blacklist match, the class is **rejected**
+     with an `*InvalidClassError` whose reason is
+     `Class blocked from deserialization (blacklist)`, and an error line
+     `Blocked by blacklist '<pattern>'. Match found for '<class>'` is logged.
+   - In profiling mode: a match is logged (`Blacklist match: '<class>'`) but the
+     class is **not** rejected.
+2. **Whitelist**. Each whitelist pattern is tested with the same substring
+   semantics. The first match marks the class safe.
+   - In blocking mode: if **no** whitelist pattern matches, the class is
+     **rejected** with reason
+     `Class blocked from deserialization (non-whitelist)`, and an error line
+     `Blocked by whitelist. No match found for '<class>'` is logged.
+   - In profiling mode: a class is never rejected.
+3. Otherwise the class is **accepted**.
+
+Key properties (preserved from the original):
+
+- **Default deny**: a class that matches nothing is rejected.
+- **Blacklist precedence**: a class matching both lists is rejected by the
+  blacklist.
+- **Fail closed / abort**: the first rejected class aborts the entire
+  deserialization at that point in the stream.
+- Rejection applies to every class in the object graph, including nested
+  objects, superclass descriptors, and array element types.
+
+## Public API
+
+Package `github.com/ikkisoft/serialkiller/serialkiller`.
+
+| Java construct                                   | Go equivalent                                                  |
+|--------------------------------------------------|----------------------------------------------------------------|
+| `SerialKiller(InputStream, String)`              | `NewSerialKiller(io.Reader, string) (*SerialKiller, error)`    |
+| `SerialKiller.readObject()`                      | `(*SerialKiller).ReadObject() (interface{}, error)`            |
+| `resolveClass` decision / `isProfiling`          | `(*SerialKiller).Profiling() bool`, `Config() *Configuration`  |
+| `SerialKiller.Configuration`                     | `Configuration`, `NewConfiguration(string) (*Configuration, error)` |
+| `Configuration.reloadIfNeeded()`                 | `(*Configuration).ReloadIfNeeded()`                            |
+| `Configuration.blacklist()/whitelist()`          | `(*Configuration).Blacklist()/Whitelist() *PatternList`        |
+| `Configuration.isProfiling()`                    | `(*Configuration).IsProfiling() bool`                          |
+| `SerialKiller.PatternList`                       | `PatternList`, `NewPatternList([]string) (*PatternList, error)`|
+| `PatternList` iteration / `toString()`           | `(*PatternList).Patterns() []*Pattern`, `Len()`, `String()`    |
+| `java.util.regex.Pattern#pattern()`              | `(*Pattern).Pattern() string`, `Find(string) bool`, `String()` |
+| `InvalidClassException(classname, reason)`       | `*InvalidClassError{ClassName, Reason}`                        |
+| `IllegalStateException`                          | `*IllegalStateError`                                           |
+| `NullPointerException` (`requireNonNull`)        | `*NilRegExpsError`                                             |
+| `PatternSyntaxException`                         | `*PatternSyntaxError`                                          |
+| `commons-logging` Log                            | `Logger` interface + `DefaultLogger`; `SetLogger`              |
+
+`InvalidClassError` exposes the offending `ClassName` and an `Error()` of
+`"<classname>; <reason>"`, matching Java's
+`InvalidClassException.getMessage()`.
+
+The `Logger` interface lets callers capture the observable log output
+(`Error`/`Info`). The default logger writes `Error` lines to the standard
+logger and discards `Info`, matching the default blocking-mode logging of the
+original.
+
+## Tests
+
+The Go test suite ports every scenario from the original Java test suite
+(`ConfigurationTest`, `PatternListTest`, `SerialKillerTest`,
+`SerialKillerSpeedTest`) and adds explicit security-boundary tests. Run:
+
+```sh
+go test ./...
+```
+
+The serialized fixtures under `testdata/` (`*.ser`) are byte-for-byte Java
+serialization streams produced by a JVM `ObjectOutputStream`, so the tests
+exercise the real stream format the filter must handle — including the
+`hibernate1.ser` gadget payload used to verify blacklist rejection.
+
+## License
+
+See [LICENSE](LICENSE). This project retains the original SerialKiller license.
